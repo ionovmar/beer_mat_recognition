@@ -7,8 +7,8 @@ import os
 
 class Detector:
     def __init__(self, filename):
-        self.CROP_OFFSET = 3
-        self.MIN_AREA = 20000
+        self.CROP_OFFSET = 10
+        self.MIN_AREA = 10000
         self.SCALE_FACTOR = {'x': 1, 'y': 1}
         self.filename = filename
         self.image = self.get_image()
@@ -42,22 +42,77 @@ class Detector:
     def image_preprocessing(self):  
         # Provide morphological operations and find edges
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        edged = cv2.Canny(blurred, 10, 100)
 
-        # Define a (3, 3) structuring element
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges = cv2.Canny(gray, 100, 200, 9, L2gradient=False)
 
-        # Apply the dilation operation to the edged image
-        dilate = cv2.dilate(edged, kernel, iterations=1)
+        # Dilation for circular edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        dilate = cv2.dilate(edges, kernel, iterations=7)
+
         return dilate
 
     def get_contours(self):
         dilate = self.image_preprocessing()
+
         # Contours detection
-        contours, hierarchy = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, hierarchy = cv2.findContours(dilate, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        hierarchy = hierarchy[0]
+
+        # Filter hierarchy based on hierarchy, take only the outer contours with large area
+        hierarchy_new = {}
+        new_index = 0
+        for i, (next, prev, child, parent) in enumerate(hierarchy):
+            if parent == -1 and cv2.contourArea(contours[i]) > self.MIN_AREA:
+                hierarchy_new[i] = [new_index, next, prev, child]
+                new_index += 1
+
+        for original_index, (new_index, next, prev, child) in hierarchy_new.items():
+            if next in hierarchy_new:
+                hierarchy_new[original_index][1] = hierarchy_new[next][0]
+            if prev in hierarchy_new:
+                hierarchy_new[original_index][2] = hierarchy_new[prev][0]
+            if child in hierarchy_new:
+                hierarchy_new[original_index][3] = hierarchy_new[child][0]
+
+        # Update contours to only keep the contours that are not holes
+        contours = [contours[i] for i in range(len(contours)) if
+                    hierarchy[i][3] == -1 and cv2.contourArea(contours[i]) > 10000]
+
+        # Update hierarchy_new keys to new_index
+        hierarchy_new = {new_index: (next, prev, child) for _, (new_index, next, prev, child) in hierarchy_new.items()}
+
+        # For neighbors, select the outer contour
+        for new_index, (next, prev, child) in hierarchy_new.items():
+            if next in hierarchy_new and hierarchy_new[next] is not None:
+                # Compare these two contours and select the larger one
+                if cv2.contourArea(contours[new_index]) < cv2.contourArea(contours[next]):
+                    contours[new_index] = None
+                    hierarchy_new[new_index] = None
+            if prev in hierarchy_new and hierarchy_new[prev] is not None:
+                # Compare these two contours and select the larger one
+                if cv2.contourArea(contours[new_index]) < cv2.contourArea(contours[prev]):
+                    contours[new_index] = None
+                    hierarchy_new[new_index] = None
+
+        # Filter contours near (not on the) the border of the image
+        height, width = dilate.shape
+        border_offset = self.CROP_OFFSET
+        contours = [contour for contour in contours if contour is not None and not any([point[0][
+                                                                                            0] < border_offset or
+                                                                                        point[0][
+                                                                                            0] > width - border_offset or
+                                                                                        point[0][
+                                                                                            1] < border_offset or
+                                                                                        point[0][
+                                                                                            1] > height - border_offset
+                                                                                        for point in contour])]
+        # Make the contours closed
+        contours = [cv2.approxPolyDP(contour, 0.0001 * cv2.arcLength(contour, False), False) for contour in contours]
+
         image_copy = self.image.copy()
+
         borders = []
+        image_copy = self.image.copy()
         # Contours drawing
         for cnt in contours:
             # Get the 4 points of the bounding rectangle
@@ -81,19 +136,21 @@ class Detector:
         return mats
 
     def get_masks(self, contours):
-        marks = []
+        masks = []
         for cnt in contours:
-            if cv2.contourArea(cnt) > 100000:
-                # Created a new mask and used bitwise_and to select for contours:
-                # hull = cv2.convexHull(cnt)
-                perimeter = cv2.arcLength(cnt, True)
-                approximatedShape = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
-                mask = np.zeros_like(self.image)
-                cv2.drawContours(mask, [approximatedShape], 0, (255, 255, 255), -1)
-                masked_image = cv2.bitwise_and(self.image, mask)
-                marks.append(masked_image)
-                self.show_image(mask)
-        return marks
+            # Mask image - everything outside the contours stays the original color
+            mask = cv2.fillPoly(np.ones_like(self.image), contours, (255, 255, 255))
+
+            # Erode the mask to shrink the contours
+            kernel = np.ones((5, 5), np.uint8)  # 5x5 kernel for 2-pixel erosion
+            eroded_mask = cv2.erode(mask, kernel, iterations=5)
+
+            # Mask image with eroded mask and keep the original color outside the contours
+            white_image = np.ones_like(self.image) * 255
+            segmented_image = np.where(eroded_mask == 1, white_image, self.image)
+            self.show_image(segmented_image)
+            masks.append(segmented_image)
+        return masks
 
     def show_image(self, image, window_name='Result'):
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -110,9 +167,9 @@ if __name__ == '__main__':
                     'the processed image with drawn bounding rectangles '
                     'around detected shapes')
 
-    parser.add_argument('filename')  # positional argument
-    parser.add_argument('-v', '--vis', help='show result', action='store_true')  # option that takes a value
-    parser.add_argument('-s', '--save', help='save result', action='store_true')  # option that takes a value
+    parser.add_argument('filename', type=str)  # positional argument
+    parser.add_argument('-v', '--vis', help='show result', action='store_true', default=True)  # option that takes a value
+    parser.add_argument('-s', '--save', help='save result', action='store_true', default=True)  # option that takes a value
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format=f"%(levelname)-8s: %(message)s")
@@ -133,7 +190,7 @@ if __name__ == '__main__':
         detector.show_image(mat[0], window_name='Contours')
 
     logging.info(f'Summery: \nNumber of contours: {len(contours)}\n'
-                 f'Numer of borders: {len(borders)} \n'
+                 f'Number of borders: {len(borders)} \n'
                  f'Number of  masks: {len(masks)}\n'
                  f'Final number of mat: {len(mats)}')
 

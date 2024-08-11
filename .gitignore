@@ -46,3 +46,9 @@ Pipfile.lock
 *.tif
 
 .vscode/
+
+# Mac OS X stuff
+.DS_Store
+
+# Data folder (should be stored outside of the repository)
+/data
